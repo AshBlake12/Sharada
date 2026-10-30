@@ -3,8 +3,8 @@ FROM mcr.microsoft.com/vscode/devcontainers/base:${VARIANT}
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PDK_ROOT=/home/vscode/ttsetup/pdk
-ENV PDK=ihp-sg13g2
-ARG TT_SUPPORT_TOOLS_BRANCH=main
+ENV PDK=ihp-sg13cmos5l
+ARG TT_SUPPORT_TOOLS_BRANCH=ihp-sg13cmos5l
 
 RUN apt update
 RUN apt install -y iverilog gtkwave python3 python3-pip python3-venv python3-tk python-is-python3 libcairo2 verilator libpng-dev libqhull-dev
@@ -26,4 +26,13 @@ RUN umask 022 && \
     chmod 755 /usr/local/bin
 
 # Install LibreLane
-RUN /ttsetup/venv/bin/pip install librelane==3.0.0.dev44
+RUN /ttsetup/venv/bin/pip install librelane==3.1.0.dev3
+
+# Install the ihp-sg13cmos5l PDK at the revision the ihp-cmos5l CI pins
+# (TinyTapeout/tt-gds-action@ihp-cmos5l, install_sg13cmos5l.sh)
+ARG IHP_PDK_REV=2bbec755dc67ca3db0261c3d6163e15735d66710
+RUN mkdir -p ${PDK_ROOT} && \
+    git -C ${PDK_ROOT} init -q && \
+    git -C ${PDK_ROOT} fetch -q --depth 1 https://github.com/IHP-GmbH/IHP-Open-PDK.git ${IHP_PDK_REV} && \
+    git -C ${PDK_ROOT} checkout -q FETCH_HEAD && \
+    echo "IHP-Open-PDK ${IHP_PDK_REV}" > ${PDK_ROOT}/ihp-sg13cmos5l/SOURCES

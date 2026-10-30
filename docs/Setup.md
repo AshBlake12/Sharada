@@ -53,7 +53,7 @@ yosys -V && verilator --version && sby --version
 ## Project repo
 
 ```sh
-git clone https://github.com/TinyTapeout/tt-support-tools tt
+git clone -b ihp-sg13cmos5l https://github.com/TinyTapeout/tt-support-tools tt
 echo "tt/" >> .gitignore
 ```
 
@@ -80,9 +80,10 @@ uv pip install -r ~/eda/protocol-emulator-asic/tt/requirements.txt
 Environment variables in `~/ttsetup/env.sh` so you can re-source them:
 
 ```sh
-export PDK_ROOT=~/ttsetup/pdk
-export PDK=ihp-sg13g2
-export LIBRELANE_TAG=3.0.3
+# Matches the ihp-cmos5l CI (TinyTapeout/tt-gds-action@ihp-cmos5l)
+export PDK_ROOT=~/ttsetup/pdk-cmos5l
+export PDK=ihp-sg13cmos5l
+export LIBRELANE_TAG=3.1.0.dev3
 ```
 
 ```sh
@@ -90,13 +91,26 @@ source ~/ttsetup/env.sh
 uv pip install librelane==$LIBRELANE_TAG
 ```
 
+The CMOS5L PDK is not installed by ciel; tt-support-tools passes `--manual-pdk`. Clone it at the revision the CI pins (from `install_sg13cmos5l.sh` in tt-gds-action):
+
+```sh
+IHP_PDK_REV=2bbec755dc67ca3db0261c3d6163e15735d66710
+mkdir -p $PDK_ROOT
+git -C $PDK_ROOT init -q
+git -C $PDK_ROOT fetch -q --depth 1 https://github.com/IHP-GmbH/IHP-Open-PDK.git $IHP_PDK_REV
+git -C $PDK_ROOT checkout -q FETCH_HEAD
+echo "IHP-Open-PDK $IHP_PDK_REV" > $PDK_ROOT/ihp-sg13cmos5l/SOURCES
+```
+
+When the CI action bumps either version, bump `env.sh`, this file and `.devcontainer/Dockerfile` together. `ihp-sg13g2` is a different process; the `main` branch of tt-support-tools targets it, not CMOS5L.
+
 `librelane --version`
 
 ---
 
 ## First harden
 
-Note the `--ihp` flag. Every `tt_tool.py` command needs it on this PDK.
+Note the `--ihp` flag. Every `tt_tool.py` command needs it. On the `ihp-sg13cmos5l` branch of tt-support-tools it selects CMOS5L.
 
 ```sh
 ./tt/tt_tool.py --ihp --create-user-config
@@ -109,10 +123,9 @@ Note the `--ihp` flag. Every `tt_tool.py` command needs it on this PDK.
 
 ```sh
 ls runs/wokwi/final/gds/          # a .gds exists
-grep -ri "Design area" runs/wokwi/*/reports/ | head
 ```
 
-Record the cell count and area in the repo now, in `docs/area-log.md`, with the date and commit hash. 
+Record the numbers from `runs/wokwi/final/metrics.json` in `docs/area-log.md`, with the date, commit hash and PDK.
 
 ---
 
