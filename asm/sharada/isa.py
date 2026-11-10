@@ -23,7 +23,9 @@ NTHREADS = 4
 IMEM_AW = 9          # 512 words
 IMEM_WORDS = 1 << IMEM_AW
 NLANES = 4
-CHAN_DEPTH = 4
+LANES_FULL = 0b0011  # lanes with a 32-bit LFSR, the sync correlator and 32-bit INIT/CHK; the rest are light (see sh_lane)
+CHAN_DEPTH = 4       # inter-thread channels CH_A, CH_B
+HOST_DEPTH = 32      # host channels, each way: the host drops a burst and the threads take it from there
 
 # --------------------------------------------------------------------------
 # Opcodes. Grouped by the top bits so the decoder stays shallow.
@@ -64,11 +66,13 @@ REG_BRANCHES = {"BEQ", "BNE", "BLTU", "BGEU"}
 BIT_BRANCHES = {"BBS", "BBC"}
 
 # WAIT immediate:
-#   imm[15] = 0 : event wait.  imm[9:8] = lane, imm[7:0] = event mask.
+#   imm[15] = 0 : event wait.  imm[9:8] = lane, imm[7:0] = event mask bits
+#                 7:0, imm[13:12] = event mask bits 9:8.
 #                 Completes when (lane.events & mask) != 0, and clears the
 #                 sticky events it matched (so a WAIT consumes its event).
 #   imm[15] = 1 : pin wait.    imm[4:0] = pin, imm[5] = level.
 WAIT_PIN_FLAG = 1 << 15
+WAIT_EV_HI_SHIFT = 12   # event mask bits 9:8 live in imm[13:12]
 
 # --------------------------------------------------------------------------
 # IO space (8-bit addresses)
@@ -77,6 +81,7 @@ IO = {
     "CH_HOST":      0x00,  # R: pop host->core channel.  W: push core->host channel.
     "CH_A":         0x01,  # R: pop, W: push.  Inter-thread channel.
     "CH_B":         0x02,
+    "ECC":          0x03,  # R: [15] uncorrectable seen, [14:9] words repaired (sat. 63), [8:0] last error address
     "GPIO_OUT":     0x04,  # [7:0] uio, [15:10] uo[7:2]
     "GPIO_OUT_SET": 0x05,
     "GPIO_OUT_CLR": 0x06,
@@ -86,12 +91,21 @@ IO = {
     "PINS":         0x0A,  # R: {ui_in, uio_in} synchronised
     "TID":          0x0B,  # R: own thread id
     "TIMER":        0x0C,  # R: free-running clock-cycle counter, low 16 bits
-    "SPAWN":        0x0D,  # W: [10:9] tid, [8:0] pc.  Starts that thread.
+    "SPAWN":        0x0D,  # W: [10:9] tid, [8:0] pc.  Starts that thread, registers zeroed.
     "STOP":         0x0E,  # W: [3:0] mask of threads to stop
+    "TIMEH":        0x0F,  # R: free-running counter, high 16 bits (read TIMEH, TIMER, TIMEH)
+    "PB_DATA":      0x10,  # Packet buffer (1024 x 16). R: word at RP, RP++.  W: store at WP, WP++.
+    "PB_RP":        0x11,  # R/W: read pointer [9:0]
+    "PB_WP":        0x12,  # R/W: write pointer [9:0]
+    "PB_ECC":       0x13,  # R: [15] uncorrectable seen, [14:10] words repaired (sat. 31), [9:0] last error address.  W: clear
 }
 
-LANE_BASE = 0x10
-LANE_STRIDE = 0x10
+PBUF_WORDS = 1024       # packet buffer, 16-bit words
+
+# Each lane has a 32-register window (v3). 0x10..0x1F stay free for core IO.
+LANE_BASE = 0x20
+LANE_SHIFT = 5
+LANE_STRIDE = 1 << LANE_SHIFT
 LANE_REGS = {
     "DATA":   0x0,  # R: pop RX word (blocks). W: push TX word (blocks), tagged with TXTAG.
     "STATUS": 0x1,  # R: events.  W: write-1-to-clear sticky events.
@@ -100,14 +114,46 @@ LANE_REGS = {
     "SAMPLE": 0x4,  # phase at which RX samples
     "SJW":    0x5,  # resync jump width, in clocks
     "PINSEL": 0x6,  # [4:0] tx pin, [9:5] rx pin, [14:10] clk pin
-    "RXCFG":  0x7,  # [3:0] rx bits-1, [7:4] destuff N (0 = off), [8] rx crc enable
-    "TXTAG":  0x8,  # latched with every DATA write: [3:0] bits-1, [4] stuff, [5] crc, [6] send crc
-    "TXCFG":  0x9,  # [3:0] stuff N (0 = off)
+    "RXCFG":  0x7,  # [3:0] rx bits-1, [7:4] destuff N (0 = off), [8] crc, [9] ones-only, [11:10] line code
+    "TXTAG":  0x8,  # latched with every DATA write: [3:0] bits-1, then TXTAG_BITS and TX_START
+    "TXCFG":  0x9,  # [3:0] stuff N (0 = off), [4] ones-only, [6:5] line code
     "CRC":    0xA,  # R/W: CRC register
     "POLY":   0xB,  # CRC polynomial (without the implicit top bit)
     "CRCW":   0xC,  # CRC width - 1
     "EDGE":   0xD,  # phase of SCK's middle edge (controller mode)
+    "IDLEN":  0xE,  # W: [3:0] bus-idle length N (0 = off).  R: [7:4] idle count, [3:0] N
+    # v3: universal LFSR (docs/v3-architecture.md 4.1) and stuffing modes
+    "CRCH":   0x10, # R/W: LFSR register, bits 31:16
+    "POLYH":  0x11, # polynomial or taps, bits 31:16
+    "LCFG":   0x12, # [1:0] LFSR mode, [2] send CRC inverted, [3] send CRC LSB first, [4] CRC includes dynamic stuff bits, [5] TX CRC from the sent bit
+    "ERRCNT": 0x13, # R: PRBS bit errors seen in DESCR mode (saturates). W: clear
+    "SCNT":   0x14, # R: dynamic stuff bits inserted (TX) or removed (RX), mod 256. W: clear
+    "RXCFG2": 0x15, # [3:0] fixed destuffing M (0 = off); [6:4] K: with CINIT, reload the LFSR from INIT after word K of a frame (0 = at its start)
+    # v3: framing and pin pairs (docs/v3-architecture.md 4.7)
+    "LCTL2":  0x16, # pin pair, idle mode, both-edge resync, SE0 frame end, correlator, half duplex, CRC restart (LCTL2_BITS)
+    "QUIET":  0x17, # a frame ends at a sample this many clocks or more after the last rx edge (0 = off)
+    "PAT":    0x18, # sync pattern, bits 15:0; the newest received bit is bit 0
+    "PATH":   0x19, # sync pattern, bits 31:16
+    "MSK":    0x1A, # which pattern bits must match, 15:0
+    "MSKH":   0x1B, # 31:16
+    "INIT":   0x1C, # LFSR value loaded at a frame's start (CINIT), 15:0
+    "INITH":  0x1D, # 31:16
+    "CHK":    0x1E, # residual the LFSR must hold at a frame's end for CRCOK, 15:0
+    "CHKH":   0x1F, # 31:16
 }
+
+# LCTL2. Pin-claim behaviour, so it is held in TMR like CTRL.
+LCTL2_BITS = {
+    "PAIR":     0,  # the clk pin carries the complement of TX (D-, TD-); SE0 drives both low
+    "BOTHEDGE": 3,  # resynchronise on rising and falling rx edges (NRZI)
+    "SE0END":   4,  # a frame ends when rx and the clk pin are both low at a sample (USB EOP)
+    "CORR":     5,  # after the hunt edge, search for PAT under MSK before assembling words
+    "HDX":      6,  # half duplex: do not receive while transmitting
+    "CINIT":    7,  # reload the LFSR from INIT at a frame's start (see RXCFG2 K)
+}
+LCTL2_IDLE_SHIFT = 1    # [2:1]: what the TX pin(s) do while idle
+LCTL2_IDLE = {"DRIVE": 0, "RELEASE": 1, "LOW": 2}
+RXCFG2_K_SHIFT = 4
 
 CTRL_BITS = {
     "EN":        0,   # lane enable (timer runs)
@@ -123,8 +169,64 @@ CTRL_BITS = {
     "ABORT":     11,  # arbitration loss stops TX until MISMATCH is cleared
     "CLKOD":     12,  # clk pin open drain, with clock stretching
     "LOOP":      13,  # internal loopback tx -> rx
+    "EFLAG":     14,  # on a bit or stuff error, send an error flag (docs/can-node.md)
+    "EXTCLK":    15,  # RX samples on clk-pin edges, not the bit timer (bus monitor)
 }
 RXMODE = {"OFF": 0, "HUNT": 1, "STREAM": 2, "SYNC": 3}
+
+# TXTAG fields above bits-1. Assembler names T_STUFF, T_ARB, T_ONIDLE, ...
+TXTAG_BITS = {
+    "STUFF":   4,   # insert stuff bits
+    "CRC":     5,   # data bits go into the CRC
+    "SENDCRC": 6,   # send the CRC register instead of the data (MSB first)
+    "ARB":     7,   # arbitration word: losing a recessive bit is LOST, not a bit error
+    "FIXED":   10,  # fixed-interval stuffing (TXCFG[11:8] = M): a stuff bit first and after every M bits
+    "RAW":     11,  # the word's bits go out as levels, skipping the line code (USB EOP's J, 10BASE-T idle)
+    "SE0":     12,  # the word's bits drive both pins of a pair low (USB SE0)
+    "IFCRC":   13,  # send only if the last frame ended with CRCOK; else drop it and halt TX (DROP)
+}
+TX_START_SHIFT = 8  # TXTAG[9:8]: when a buffered word may start
+TX_START = {
+    "NOW":     0,   # next bit boundary
+    "ONIDLE":  1,   # once the bus has been idle for more than IDLEN bits, or join a start of frame
+    "AFTERRX": 2,   # the bit boundary after the next received word completes
+    "AFTEREND": 3,  # once no frame is being received and the bus has been idle for IDLEN bits
+}
+
+# STATUS bits above the events. Sticky, write 1 to clear. Not waitable.
+# Line coding, TXCFG and RXCFG. Stuffing and the CRC see data bits; the code
+# sits between them and the pin.
+#   NRZ    the bit is the level
+#   NRZI   0 toggles the line, 1 holds it (USB)
+#   MANCH  IEEE 802.3: the first half of a bit is its complement, the second
+#          half the bit, so every bit has a mid-bit edge (10BASE-T). TX puts
+#          the mid-bit edge at phase EDGE. RX runs its timer from the mid-bit
+#          edge (phase 0 there) and samples the second half at SAMPLE, so
+#          SAMPLE is about a quarter bit; with RESYNC it follows both edge
+#          directions, only within SAMPLE clocks of the mid-bit.
+# Ones-only stuffing counts runs of 1 and inserts a 0 (USB: N = 6).
+TXCFG_BITS = {"ONES": 4}
+TXCFG_CODE_SHIFT = 5
+TXCFG_FIX_SHIFT = 8     # TXCFG[11:8]: fixed stuffing interval M for words tagged FIXED
+
+# LCFG: what the lane's LFSR does. Assembler names LF_CRC, LF_INV, ...
+LFSR_MODES = {"CRC": 0, "ADD": 1, "MULT": 2, "DESCR": 3}
+# CTXI: while transmitting, the CRC takes each data bit as it is sent rather
+# than from the bus at the sample point. Needed when the pin read-back is
+# slower than a bit (USB full speed, 10BASE-T); bus-fed is for arbitration (CAN).
+LCFG_BITS = {"INV": 2, "CLSB": 3, "CSTUFF": 4, "CTXI": 5}
+RXCFG_BITS = {"CRC": 8, "ONES": 9}
+RXCFG_CODE_SHIFT = 10
+LINE_CODES = {"NRZ": 0, "NRZI": 1, "MANCH": 2}
+
+STATUS_BITS = {
+    "LOST": 8,      # arbitration lost (with ABORT, TX is silent until cleared)
+    "ERR":  9,      # an error flag was sent (TX is silent until cleared)
+    "CRCOK": 10,    # read only: the LFSR held CHK (under the CRC width) at the last frame end
+    "DROP": 11,     # an IFCRC word was dropped (TX is silent until cleared)
+    "FEND": 12,     # sticky copy of event FEND, write 1 to clear
+    "SYNC": 13,     # sticky copy of event SYNC, write 1 to clear
+}
 
 EVENTS = {
     "TXE":      0,  # tx buffer has space            (level)
@@ -135,8 +237,11 @@ EVENTS = {
     "EDGE":     5,  # falling edge on rx              (sticky)
     "TICK":     6,  # bit boundary                    (sticky)
     "RXOVF":    7,  # rx word overwritten unread      (sticky)
+    "FEND":     8,  # a frame ended: SE0, or a sample QUIET clocks after the last edge (sticky)
+    "SYNC":     9,  # the correlator found PAT (sticky)
 }
-STICKY_MASK = 0xF8
+NEVENTS = 10
+STICKY_MASK = 0x3F8
 
 # Pin numbering used by PINSEL, WAIT and the docs.
 #   0..7   uio[0..7]   bidirectional
@@ -158,6 +263,7 @@ HOST_CMDS = {
     "POP":        0x05,  # returns valid hi lo            <- core->host channel
     "STATUS":     0x06,  # returns status byte
     "LOCKSTEP":   0x07,  # mask: bit p pairs thread p (master) with p+2; clears faults
+    "ECC":        0x08,  # returns repaired, {ue, tmr, 0, addr[8]}, addr[7:0]; then clears the log
 }
 
 
@@ -177,6 +283,27 @@ def symbols() -> dict:
         s[f"C_{name}"] = 1 << bit
     for name, val in RXMODE.items():
         s[f"RX_{name}"] = val << CTRL_BITS["RXMODE"]
+    for name, bit in TXTAG_BITS.items():
+        s[f"T_{name}"] = 1 << bit
+    for name, val in TX_START.items():
+        s[f"T_{name}"] = val << TX_START_SHIFT
+    for name, bit in TXCFG_BITS.items():
+        s[f"TC_{name}"] = 1 << bit
+    for name, bit in RXCFG_BITS.items():
+        s[f"RC_{name}"] = 1 << bit
+    for name, val in LINE_CODES.items():
+        s[f"TC_{name}"] = val << TXCFG_CODE_SHIFT
+        s[f"RC_{name}"] = val << RXCFG_CODE_SHIFT
+    for name, val in LFSR_MODES.items():
+        s[f"LF_{name}"] = val
+    for name, bit in LCFG_BITS.items():
+        s[f"LF_{name}"] = 1 << bit
+    for name, bit in LCTL2_BITS.items():
+        s[f"L2_{name}"] = 1 << bit
+    for name, val in LCTL2_IDLE.items():
+        s[f"L2_{name}"] = val << LCTL2_IDLE_SHIFT
+    for name, bit in STATUS_BITS.items():
+        s[f"S_{name}"] = 1 << bit
     for name, bit in EVENTS.items():
         s[f"E_{name}"] = 1 << bit
     for i in range(8):

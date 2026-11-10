@@ -234,7 +234,8 @@ class Assembler:
             need(2)
             lane = self._imm(ops[0], 0, isa.NLANES - 1, "lane")
             mask = self._imm(ops[1], 1, 255, "event mask")
-            return E("WAIT", i=1, imm=(lane << 8) | mask)
+            return E("WAIT", i=1, imm=(lane << 8) | (mask & 0xFF)
+                     | ((mask >> 8) << isa.WAIT_EV_HI_SHIFT))
         if m == "waitp":
             need(2)
             pin = self._imm(ops[0], 0, 23, "pin")
